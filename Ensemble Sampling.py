@@ -1,430 +1,515 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier
-from catboost import Pool
+from catboost import CatBoostClassifier, Pool
 from lifelines import KaplanMeierFitter
 from lifelines.utils import datetimes_to_durations
 from scipy import stats
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix, auc
-from sklearn.metrics import roc_curve, roc_auc_score
+from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
-from sklearn import preprocessing
 from tabulate import tabulate
 import seaborn as sns
 
-class LoglossObjective(object):
-    def __init__(self, penalty=2,alpha = 0.5,mrf_weight = 0.5,reward_factor = 0.9):
+# Configuration class: Manages all hyperparameters and file paths
+class ModelConfig:
+    """Configuration for model training, data paths and visualization"""
+    # File paths (replace with your actual paths)
+    DATA_PATHS = {
+        'train': r"your path/EC_before_Treatment labeled 8.2 PFS.csv",
+        'test': r"your path/EC_before_Treatment test data 8.1 PFS.csv",
+        'validation': r"your path/EC_before_Treatment 7.12 PFS external validation.csv",
+        'full': r"your path/EC_before_Treatment 7.12 OS after preprocessing.csv",
+        'drop': r"your path/EC_before_Treatment_unlabeled_samples 22 7.22.csv"
+    }
+    # CatBoost hyperparameters
+    CATBOOST_PARAMS = {
+        'depth': 8,
+        'iterations': 400,
+        'learning_rate': 0.1,
+        'early_stopping_rounds': 50,
+        'eval_metric': 'Logloss',
+        'random_seed': 42
+    }
+    # Categorical features for CatBoost
+    CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'PTV_Dose', 'GTV_Dose', 'ECOG', 'T', 'Chemotherapy']
+    # Features to standardize (keywords matching)
+    STANDARDIZE_KEYWORDS = ['treatment', 'TL', 'original']
+    # Label noise levels
+    NOISE_LEVELS = {
+        'train': 0.05,
+        'test': 0.01,
+        'validation': 0.01
+    }
+    # Visualization settings
+    PLOT_FIGSIZE = (8, 6)
+    PLOT_TITLE_FONTSIZE = 25
+    PLOT_LABEL_FONTSIZE = 20
+    TOP_FEATURES = 10  # Number of top features to show in importance plot
+
+# Custom Logloss Objective for CatBoost
+class CustomLoglossObjective:
+    """
+    Custom Logloss Objective for CatBoost with penalty/reward mechanism
+    Combines Logloss and Quantile Loss with dynamic penalty for overconfident wrong predictions
+    """
+    def __init__(self, penalty=2, alpha=0.5, mrf_weight=0.5, reward_factor=0.9):
         self.alpha = alpha
         self.penalty = penalty
         self.mrf_weight = mrf_weight
         self.reward_factor = reward_factor
+
     def stable_log(self, x, eps=1e-10):
-        # 使用 log1p 来确保数值稳定性
+        """Numerically stable log calculation to avoid division by zero"""
         return np.log1p(x + eps) if x > 1 - eps else np.log(x + eps)
 
     def calc_ders_range(self, approxes, targets, weights):
-        # approxes, targets, weights are indexed containers of floats
-        # (containers with only __len__ and __getitem__ defined).
-        # weights parameter can be None.
-        # Returns list of pairs (der1, der2)
+        """
+        Calculate first and second derivatives for CatBoost custom loss
+        Args:
+            approxes: Model predictions (list of floats)
+            targets: True labels (list of floats)
+            weights: Sample weights (list of floats, optional)
+        Returns:
+            list: Pairs of (first derivative, second derivative)
+        """
         assert len(approxes) == len(targets)
         if weights is not None:
             assert len(weights) == len(approxes)
 
-        exponents = [np.exp(a) for a in approxes]  # 使用列表推导式提高效率
+        exponents = [np.exp(a) for a in approxes]
         gamma = 2
         beta = 0.5
         result = []
-        for index in range(len(targets)):
 
-            p = exponents[index] / (1 + exponents[index])
-            # 计算 penalty，当 p 等于 0.5 时，不应用任何惩罚
+        for idx in range(len(targets)):
+            p = exponents[idx] / (1 + exponents[idx])
             penalty = 1.0
-            if (targets[index] == 1 and p < 0.2) or (targets[index] == 0 and p > 0.8):
+
+            # Apply penalty for overconfident wrong predictions
+            if (targets[idx] == 1 and p < 0.2) or (targets[idx] == 0 and p > 0.8):
                 penalty *= self.penalty
-            # 初始化 reward_factor 为 1，以便在 p 不等于 0.5 时进行调整
+
+            # Apply reward for confident correct predictions
             reward_factor = 1.0
-            # 根据 p 和目标值调整 reward_factor
-            if targets[index] == 1:
-                if p > 0.8:
-                    reward_factor *= self.reward_factor
-            elif targets[index] == 0:
-                if p < 0.2:
-                    reward_factor *= self.reward_factor
+            if targets[idx] == 1 and p > 0.8:
+                reward_factor *= self.reward_factor
+            elif targets[idx] == 0 and p < 0.2:
+                reward_factor *= self.reward_factor
 
-            der1_log = (1-p) *self.penalty   if targets[index] > 0.0 else -p *self.penalty
-            der2_log = -p * (1-p)
+            # Logloss derivatives
+            der1_log = (1 - p) * self.penalty if targets[idx] > 0.0 else -p * self.penalty
+            der2_log = -p * (1 - p)
 
-            der1_mse = 2 * (p - targets[index])
-            der2_mse = 2
-            # mrf_penalty = self.mrf_weight * (approxes[index] - approxes[index - 1]) ** 2 if index > 0 else 0
-            delta = 0.1 # Huber loss parameter
-            # 计算 Huber 损失的一阶导数
-            der1_huber = (targets[index] - p) if abs(targets[index] - p) <= delta else np.sign(targets[index] - p) * delta
-            # 计算 Huber 损失的二阶导数
-            der2_huber = 1 if abs(targets[index] - p) <= delta else 0
-            # 添加Hinge Loss的计算
-            margin = 1 - targets[index] * approxes[index]
-            der1_hinge = -targets[index] if margin < 0 else 0
-            der2_hinge = 0
-
-            q=0.6
-            quantile_loss = q * np.abs(targets[index] - p) if targets[index] - p >= 0 else (1 - q) * np.abs(targets[index] - p)
-            der1_quantile = q * (p-p**2) if targets[index] - p >= 0 else (q-1) * (p-p**2)
+            # Quantile loss derivatives (q=0.6)
+            q = 0.6
+            der1_quantile = q * (p - p**2) if targets[idx] - p >= 0 else (q - 1) * (p - p**2)
             der2_quantile = 0
 
-            if targets[index] > 0.0:
-                focal_loss = -beta * (1 - p) ** gamma * np.log(p + 1e-40)
-            else:
-                focal_loss = -((1 - beta) * p) ** gamma * np.log(1 - p + 1e-40)
-            if targets[index] > 0.0:
-                der1_focal = beta * gamma * (1 - p) ** (gamma - 1) * np.log(p+1e-40) - beta * (1-p) ** gamma  * 1/(p+1e-40)
-            else:
-                der1_focal = -gamma * p **(gamma-1) * np.log(1-p+1e-40) + p**gamma*1/(1-p+1e-40)
-            der2_focal = 0
+            # Combine Logloss and Quantile loss derivatives
+            der1_combined = (der1_log + der1_quantile) / 2
+            der2_combined = (der2_log + der2_quantile) / 2
 
-            class_frequency = np.mean(targets)
-            weight_factor = 1 / class_frequency if targets[index]  == 1 else class_frequency
-
-
-            der1_combined = (der1_log+der1_quantile) / 2
-            der2_combined = (der2_log+der2_quantile) / 2
-
-
+            # Apply sample weights if provided
             if weights is not None:
-                der1_combined *= weights[index]
-                der2_combined *= weights[index]
-
-
+                der1_combined *= weights[idx]
+                der2_combined *= weights[idx]
 
             result.append((der1_combined, der2_combined))
 
         return result
-def add_noise_to_labels(y_train, noise_level):
+
+# Data processing functions
+def load_data(file_paths: dict) -> tuple:
     """
-    Add noise to the labels of the training set.
-
-    Parameters:
-        y_train (numpy array): True labels of the training set.
-        noise_level (float): Percentage of labels to flip (e.g., 0.1 for 10% noise).
-
+    Load and preprocess all datasets (drop NA values)
+    Args:
+        file_paths: Dictionary of data file paths
     Returns:
-        noisy_labels (numpy array): Labels with added noise.
+        tuple: Train, test, validation, full, drop datasets (pd.DataFrame)
+    Raises:
+        FileNotFoundError: If any file path is invalid
     """
-    num_samples = len(y_train)
-    num_noise_samples = int(noise_level * num_samples)
+    try:
+        train_data = pd.read_csv(file_paths['train']).dropna()
+        test_data = pd.read_csv(file_paths['test']).dropna()
+        validation = pd.read_csv(file_paths['validation']).dropna()
+        full_data = pd.read_csv(file_paths['full']).dropna()
+        drop_data = pd.read_csv(file_paths['drop']).dropna()
+        return train_data, test_data, validation, full_data, drop_data
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Data file not found: {e.filename}")
 
-    # Randomly select indices to flip
-    noise_indices = np.random.choice(num_samples, num_noise_samples, replace=False)
+def add_label_noise(y: np.ndarray, noise_level: float) -> np.ndarray:
+    """
+    Add random noise to binary labels by flipping a percentage of samples
+    Args:
+        y: Original binary labels (0/1)
+        noise_level: Fraction of labels to flip (0 to 1)
+    Returns:
+        np.ndarray: Noisy labels
+    """
+    num_samples = len(y)
+    num_noise = int(noise_level * num_samples)
+    noise_indices = np.random.choice(num_samples, num_noise, replace=False)
+    
+    noisy_y = np.copy(y)
+    noisy_y[noise_indices] = 1 - noisy_y[noise_indices]
+    return noisy_y
 
-    # Flip the labels at selected indices
-    noisy_labels = np.copy(y_train)
-    noisy_labels[noise_indices] = 1 - noisy_labels[noise_indices]  # Flipping labels
+def standardize_features(X_train: pd.DataFrame, X_test: pd.DataFrame, X_val: pd.DataFrame, 
+                         keywords: list) -> tuple:
+    """
+    Standardize selected features (matching keywords) using StandardScaler
+    Args:
+        X_train/X_test/X_val: Feature DataFrames
+        keywords: List of keywords to identify features for standardization
+    Returns:
+        tuple: Standardized X_train, X_test, X_val
+    """
+    scaler = StandardScaler()
+    columns_to_standardize = [col for col in X_train.columns if any(kw in col for kw in keywords)]
+    
+    # Fit scaler on training data only to avoid data leakage
+    X_train[columns_to_standardize] = scaler.fit_transform(X_train[columns_to_standardize])
+    X_test[columns_to_standardize] = scaler.transform(X_test[columns_to_standardize])
+    X_val[columns_to_standardize] = scaler.transform(X_val[columns_to_standardize])
+    
+    return X_train, X_test, X_val
 
-    return noisy_labels
+def prepare_features_labels(train_data: pd.DataFrame, test_data: pd.DataFrame, 
+                            val_data: pd.DataFrame, noise_levels: dict) -> tuple:
+    """
+    Prepare features (X) and labels (y) for training, test and validation sets
+    Includes label noise addition and feature standardization
+    Args:
+        train_data/test_data/val_data: Raw DataFrames
+        noise_levels: Dictionary of noise levels for each dataset
+    Returns:
+        tuple: X_train, y_train, y_train_noisy, X_test, y_test, y_test_noisy, X_val, y_val, y_val_noisy
+    """
+    # Extract features and labels (drop PFS/PFS_m)
+    X_train = train_data.drop(['PFS', 'PFS_m'], axis=1).astype(str)
+    y_train = train_data['PFS'].values
+    X_test = test_data.drop(['PFS', 'PFS_m'], axis=1).astype(str)
+    y_test = test_data['PFS'].values
+    X_val = val_data.drop(['PFS', 'PFS_m'], axis=1).astype(str)
+    y_val = val_data['PFS'].values
 
-train_data = pd.read_csv("D:\Acsq\BIM硕士第三学期\AD/final data\EC_before_Treatment labeled 8.2 PFS.csv").dropna()
-test_data = pd.read_csv("D:\Acsq\BIM硕士第三学期\AD/final data\EC_before_Treatment test data 8.1 PFS.csv").dropna()
-validation = pd.read_csv("D:\Acsq\BIM硕士第三学期\AD/final data\EC_before_Treatment 7.12 PFS external validation.csv")
-data = pd.read_csv("D:\Acsq\BIM硕士第三学期\AD\EC_before_Treatment 7.12 OS after preprocessing.csv").dropna()
-drop_data = pd.read_csv("D:\Acsq\BIM硕士第三学期\AD\EC_before_Treatment_unlabeled_samples 22 7.22.csv").dropna()
+    # Add noise to labels
+    y_train_noisy = add_label_noise(y_train, noise_levels['train'])
+    y_test_noisy = add_label_noise(y_test, noise_levels['test'])
+    y_val_noisy = add_label_noise(y_val, noise_levels['validation'])
 
+    # Standardize selected features
+    X_train, X_test, X_val = standardize_features(
+        X_train, X_test, X_val, ModelConfig.STANDARDIZE_KEYWORDS
+    )
 
+    return X_train, y_train, y_train_noisy, X_test, y_test, y_test_noisy, X_val, y_val, y_val_noisy
 
-train_all = pd.concat([train_data,drop_data],axis=0)
-train_all_X = train_all.drop(['OS','OS_m'],axis=1).astype(str)
-train_all_y = train_all['OS']
+# Model training functions
+def train_catboost(X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame, y_test: np.ndarray,
+                   cat_features: list, params: dict) -> CatBoostClassifier:
+    """
+    Train CatBoost classifier with custom loss function
+    Args:
+        X_train/y_train: Training data
+        X_test/y_test: Validation data for early stopping
+        cat_features: List of categorical feature names
+        params: CatBoost hyperparameters
+    Returns:
+        CatBoostClassifier: Trained model
+    """
+    # Create CatBoost Pool objects
+    train_pool = Pool(X_train, y_train, cat_features=cat_features)
+    test_pool = Pool(X_test, y_test, cat_features=cat_features)
 
-X_train = train_data.drop(['PFS','PFS_m'],axis=1).astype(str)
-y_train = train_data['PFS']
-X_test = test_data.drop(['PFS','PFS_m'],axis=1).astype(str)
-y_test = test_data['PFS']
-X_validation = validation.drop(['PFS','PFS_m'],axis=1).astype(str)
-y_validation = validation['PFS']
-y_train_noisy = add_noise_to_labels(y_train, noise_level=0.05)
-y_test_noisy = add_noise_to_labels(y_test,noise_level=0.01)
-y_validation_noisy = add_noise_to_labels(y_validation,noise_level=0.01)
-X_test_final = train_data.iloc[X_test.index]
-print(X_test_final)
-# test_data = pd.concat([X_test,y_test],axis=1)
-# test_data.to_csv("D:\Acsq\BIM硕士第三学期\AD\EC_before_Treatment test data 7.24.csv", index=False)
-scaler =StandardScaler()
-keywords = ['treatment', 'TL', 'original']
-columns_to_standardize = [col for col in X_train.columns if any(keyword in col for keyword in keywords)]
-X_train[columns_to_standardize] = scaler.fit_transform(X_train[columns_to_standardize])
-X_test[columns_to_standardize] = scaler.fit_transform(X_test[columns_to_standardize])
-X_validation[columns_to_standardize] = scaler.fit_transform(X_validation[columns_to_standardize])
+    # Initialize model with custom loss
+    model = CatBoostClassifier(
+        loss_function=CustomLoglossObjective(),
+        cat_features=cat_features,
+        **params
+    )
 
-# 设置权重
-weights = pd.Series([3] * 370 + [2] * 22)  # 假设370例为3的权重，22例为2的权重
-weights = weights / weights.sum()  # 归一化权重
+    # Train model
+    model.fit(train_pool, eval_set=test_pool, verbose=False)
+    return model
 
-train_pool = Pool(X_train,y_train,cat_features=['Age','Location', 'N', 'TNM','PTV_Dose', 'GTV_Dose','ECOG','T','Chemotherapy'])
-test_pool = Pool(X_test,y_test,cat_features=['Age','Location', 'N', 'TNM','PTV_Dose', 'GTV_Dose','ECOG','T','Chemotherapy'])
+def train_baseline_models(X_train: pd.DataFrame, y_train: np.ndarray) -> dict:
+    """
+    Train baseline classification models (RandomForest, LogisticRegression, KNN, SVM, AdaBoost)
+    Args:
+        X_train/y_train: Training data
+    Returns:
+        dict: Trained baseline models
+    """
+    models = {
+        'RandomForest': RandomForestClassifier(random_state=42),
+        'LogisticRegression': LogisticRegression(max_iter=1000, random_state=42),
+        'KNN': KNeighborsClassifier(),
+        'SVM': SVC(probability=True, random_state=42),
+        'AdaBoost': AdaBoostClassifier(random_state=42)
+    }
 
+    # Train all models
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        print(f"Trained {name} model")
 
-print(X_train.columns)
-print(X_test.columns)
-print(train_pool.get_feature_names())
-print(test_pool.get_feature_names())
-catboost_model = CatBoostClassifier(depth=8, iterations=400, learning_rate=0.1,early_stopping_rounds = 50,loss_function = LoglossObjective(),eval_metric = 'Logloss', cat_features=['Age','Location', 'N', 'TNM','PTV_Dose', 'GTV_Dose','ECOG','T','Chemotherapy'],random_seed=42)
-catboost_model.fit(train_pool,eval_set = test_pool)
+    return models
 
-predictions_train = catboost_model.predict(X_train)
-predictions_test = catboost_model.predict(X_test)
-predictions_validation = catboost_model.predict(X_validation)
+# Metric calculation functions
+def calculate_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple:
+    """
+    Calculate key classification metrics: Accuracy, Sensitivity, Specificity, Precision, F1-Score
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+    Returns:
+        tuple: (accuracy, sensitivity, specificity, precision, f1_score)
+    """
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
 
-feature_importance = catboost_model.get_feature_importance(data=train_pool, type='PredictionValuesChange')
-# predictions = pd.DataFrame(predictions)
-# predictions.to_csv("D:\Acsq\BIM硕士第三学期\AD\DCA\DCA PFS validation.csv")
-
-
-def calculate_metrics(y_true, y_pred):
-    conf_matrix = confusion_matrix(y_true, y_pred)
-    TN, FP, FN, TP = conf_matrix.ravel()
-
-    accuracy = (TP + TN) / (TP + TN + FP + FN)
-    sensitivity = TP / (TP + FN)
-    specificity = TN / (TN + FP)
-    precision = TP / (TP + FP)
-    f1_score = 2 * (precision * sensitivity) / (precision + sensitivity)
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    sensitivity = tp / (tp + fn) if (tp + fn) != 0 else 0  # Recall
+    specificity = tn / (tn + fp) if (tn + fp) != 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) != 0 else 0
+    f1_score = 2 * (precision * sensitivity) / (precision + sensitivity) if (precision + sensitivity) != 0 else 0
 
     return accuracy, sensitivity, specificity, precision, f1_score
 
+def compute_metrics_summary(train_metrics: tuple, test_metrics: tuple, val_metrics: tuple) -> pd.DataFrame:
+    """
+    Compute summary metrics (mean ± std) for train, test and validation sets
+    Args:
+        train_metrics/test_metrics/val_metrics: Metrics tuples from calculate_classification_metrics
+    Returns:
+        pd.DataFrame: Summary of individual and aggregated metrics
+    """
+    # Individual metrics DataFrame
+    individual_metrics = pd.DataFrame({
+        'Dataset': ['Train', 'Test', 'Validation'],
+        'Accuracy': [train_metrics[0], test_metrics[0], val_metrics[0]],
+        'Sensitivity': [train_metrics[1], test_metrics[1], val_metrics[1]],
+        'Specificity': [train_metrics[2], test_metrics[2], val_metrics[2]],
+        'Precision': [train_metrics[3], test_metrics[3], val_metrics[3]],
+        'F1 Score': [train_metrics[4], test_metrics[4], val_metrics[4]]
+    })
 
-# 为训练集、测试集和验证集计算指标
-metrics_train = calculate_metrics(y_train_noisy, predictions_train)
-metrics_test = calculate_metrics(y_test_noisy, predictions_test)
-metrics_validation = calculate_metrics(y_validation_noisy, predictions_validation)
+    # Calculate mean and std
+    all_metrics = np.array([train_metrics, test_metrics, val_metrics])
+    mean_vals = np.mean(all_metrics, axis=0)
+    std_vals = np.std(all_metrics, axis=0, ddof=1)
 
-# 将所有指标存储在一个列表中
-all_metrics = [metrics_train, metrics_test, metrics_validation]
+    # Format mean ± std
+    metrics_names = ['Accuracy', 'Sensitivity', 'Specificity', 'Precision', 'F1 Score']
+    mean_std = pd.Series(
+        [f"{mean:.3f} ± {std:.3f}" for mean, std in zip(mean_vals, std_vals)],
+        index=metrics_names
+    )
 
-# 计算平均值和标准差
-mean_values = {
-    'Accuracy': np.mean([metrics[0] for metrics in all_metrics]),
-    'Sensitivity': np.mean([metrics[1] for metrics in all_metrics]),
-    'Specificity': np.mean([metrics[2] for metrics in all_metrics]),
-    'Precision': np.mean([metrics[3] for metrics in all_metrics]),
-    'F1 Score': np.mean([metrics[4] for metrics in all_metrics])
-}
-std_values = {
-    'Accuracy': np.std([metrics[0] for metrics in all_metrics], ddof=1),
-    'Sensitivity': np.std([metrics[1] for metrics in all_metrics], ddof=1),
-    'Specificity': np.std([metrics[2] for metrics in all_metrics], ddof=1),
-    'Precision': np.std([metrics[3] for metrics in all_metrics], ddof=1),
-    'F1 Score': np.std([metrics[4] for metrics in all_metrics], ddof=1)
-}
+    return individual_metrics, mean_std
 
-# 创建一个DataFrame来展示每个数据集的指标
-individual_metrics_df = pd.DataFrame({
-    'Dataset': ['Train', 'Test', 'Validation'],
-    'Accuracy': [metrics[0] for metrics in all_metrics],
-    'Sensitivity': [metrics[1] for metrics in all_metrics],
-    'Specificity': [metrics[2] for metrics in all_metrics],
-    'Precision': [metrics[3] for metrics in all_metrics],
-    'F1 Score': [metrics[4] for metrics in all_metrics]
-})
+def calculate_roc_auc(y_true: np.ndarray, y_probs: np.ndarray) -> tuple:
+    """
+    Calculate ROC curve points and AUC score
+    Args:
+        y_true: True labels
+        y_probs: Predicted probabilities (positive class)
+    Returns:
+        tuple: (fpr, tpr, auc_score)
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_probs)
+    auc_score = roc_auc_score(y_true, y_probs)
+    return fpr, tpr, auc_score
 
-# 为每个指标创建一个格式化的“平均值 ± 标准差”字符串
-mean_std_formatted = pd.Series({
-    'Accuracy': f"{mean_values['Accuracy']:.3f} ± {std_values['Accuracy']:.3f}",
-    'Sensitivity': f"{mean_values['Sensitivity']:.3f} ± {std_values['Sensitivity']:.3f}",
-    'Specificity': f"{mean_values['Specificity']:.3f} ± {std_values['Specificity']:.3f}",
-    'Precision': f"{mean_values['Precision']:.3f} ± {std_values['Precision']:.3f}",
-    'F1 Score': f"{mean_values['F1 Score']:.3f} ± {std_values['F1 Score']:.3f}"
-})
+# Visualization functions
+def plot_roc_curve(roc_data: dict, title: str, figsize: tuple, label_fontsize: int, title_fontsize: int):
+    """
+    Plot ROC curve for multiple datasets/models
+    Args:
+        roc_data: Dictionary of {label: (fpr, tpr, auc)}
+        title: Plot title
+        figsize: Figure size (width, height)
+        label_fontsize: Font size for axis labels
+        title_fontsize: Font size for plot title
+    """
+    plt.figure(figsize=figsize)
+    for label, (fpr, tpr, auc_score) in roc_data.items():
+        plt.plot(fpr, tpr, label=f'{label} AUC = {auc_score:.3f}')
+    
+    # Plot random guess line
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
+    
+    # Format plot
+    plt.xlabel('False Positive Rate', fontsize=label_fontsize)
+    plt.ylabel('True Positive Rate', fontsize=label_fontsize)
+    plt.title(title, fontsize=title_fontsize)
+    plt.legend()
+    plt.show()
 
-# 打印结果
-print("Individual Dataset Metrics:")
-print(individual_metrics_df)
-print("\nOverall Metrics (Mean ± Std):")
-print(mean_std_formatted)
-# 获取训练集和测试集的预测概率
-train_probs = catboost_model.predict_proba(X_train)[:, 1]
-test_probs = catboost_model.predict_proba(X_test)[:, 1]
-validation_probs = catboost_model.predict_proba(X_validation)[:,1]
-# 计算 ROC 曲线的各项指标
-train_fpr, train_tpr, _ = roc_curve(y_train_noisy, train_probs)
-test_fpr, test_tpr, _ = roc_curve(y_test, test_probs)
-validation_fpr,validation_tpr,_ = roc_curve(y_validation,validation_probs)
-# 计算 ROC 曲线下面积（AUC）
-train_auc = roc_auc_score(y_train_noisy, train_probs)
-test_auc = roc_auc_score(y_test, test_probs)
-validation_auc = roc_auc_score(y_validation,validation_probs)
+def plot_catboost_learning_curve(model: CatBoostClassifier, figsize: tuple, label_fontsize: int, title_fontsize: int):
+    """
+    Plot CatBoost learning curve (train vs validation loss)
+    Args:
+        model: Trained CatBoost model
+        figsize: Figure size
+        label_fontsize: Axis label font size
+        title_fontsize: Title font size
+    """
+    evals_result = model.get_evals_result()
+    train_loss = evals_result['learn']['Logloss']
+    val_loss = evals_result['validation']['Logloss']
 
+    plt.figure(figsize=figsize)
+    plt.plot(train_loss, label='Train')
+    plt.plot(val_loss, label='Validation')
+    plt.xlabel('Number of Iterations', fontsize=label_fontsize)
+    plt.ylabel('Logloss', fontsize=label_fontsize)
+    plt.title('CatBoost Learning Curve', fontsize=title_fontsize)
+    plt.legend()
+    plt.show()
 
-# 画出 ROC 曲线
-plt.figure(figsize=(8, 6))
-plt.plot(train_fpr, train_tpr, label=f'Train AUC = {train_auc:.3f}')
-plt.plot(test_fpr, test_tpr, label=f'Internel Validation AUC = {test_auc:.3f}')
-plt.plot(validation_fpr,validation_tpr,label = f'Externel Validation AUC = {validation_auc:.3f}')
-plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-plt.xlabel('False Positive Rate', fontsize=20)
-plt.ylabel('True Positive Rate', fontsize=20)
-plt.title('ROC Curve', fontsize=25)
-plt.legend()
-plt.show()
-# 获取训练过程中的指标值
-train_metric_values = catboost_model.get_evals_result()['learn']['Logloss']
-test_metric_values = catboost_model.get_evals_result()['validation']['Logloss']
-validation_metric_values = catboost_model.get_evals_result()['validation']['Logloss']
+def plot_top_features(model: CatBoostClassifier, pool: Pool, top_n: int, figsize: tuple = (10, 6)):
+    """
+    Plot top N feature importance from CatBoost model
+    Args:
+        model: Trained CatBoost model
+        pool: CatBoost Pool object (training data)
+        top_n: Number of top features to display
+        figsize: Figure size
+    """
+    # Get feature importance
+    feature_importance = model.get_feature_importance(data=pool, type='PredictionValuesChange')
+    feature_names = pool.get_feature_names()
 
-# 绘制学习曲线
-plt.figure(figsize=(10, 6))
-plt.plot(train_metric_values, label='Train')
-plt.plot(test_metric_values, label='IV')
-plt.plot(validation_metric_values,label = 'EV')
-plt.xlabel('Number of iterations', fontsize=20)
-plt.ylabel('Loss Function', fontsize=20)
-plt.title('CatBoost Learning Curve', fontsize=25)
-plt.legend()
-plt.show()
+    # Sort and select top N features
+    sorted_indices = np.argsort(feature_importance)[::-1]
+    top_indices = sorted_indices[:top_n]
+    top_features = [feature_names[i] for i in top_indices]
+    top_importance = [feature_importance[i] for i in top_indices]
 
-feature_importance_sorted_indices = np.argsort(feature_importance)[::-1]  # 降序排序
-top_ten_indices = feature_importance_sorted_indices[:10]  # 选择前十个
-# 提取模型的特征名称
-feature_names = train_pool.get_feature_names()
-# 选择前十个特征及其重要性
-top_ten_features = [feature_names[i] for i in top_ten_indices]
-top_ten_importance = [feature_importance[i] for i in top_ten_indices]
-# 绘制条形图
-plt.figure(figsize=(10, 6))  # 设置图形大小
-plt.barh(range(len(top_ten_features)), top_ten_importance, color='skyblue', align='center')
-plt.yticks(range(len(top_ten_features)), top_ten_features,fontdict={'size': 25})
-plt.xlabel('Importance',fontdict={'size': 25})
-plt.title('Top 10 Important Features',fontdict={'size': 30})
-plt.gca().invert_yaxis()
-plt.show()
+    # Plot horizontal bar chart
+    plt.figure(figsize=figsize)
+    plt.barh(range(len(top_features)), top_importance, color='skyblue', align='center')
+    plt.yticks(range(len(top_features)), top_features, fontsize=25)
+    plt.xlabel('Importance', fontsize=25)
+    plt.title(f'Top {top_n} Important Features', fontsize=30)
+    plt.gca().invert_yaxis()  # Invert y-axis to show top feature at the top
+    plt.show()
 
-# 训练随机森林分类器
-rf_model = RandomForestClassifier()
-rf_model.fit(X_train, y_train)
-# 训练逻辑回归模型
-lr_model = LogisticRegression(max_iter=1000)
-lr_model.fit(X_train, y_train)
-# 获取各个模型在测试集上的预测概率
-rf_probs = rf_model.predict_proba(X_test)[:, 1]
-lr_probs = lr_model.predict_proba(X_test)[:, 1]
-# 计算 ROC 曲线的各项指标
-rf_fpr, rf_tpr, _ = roc_curve(y_test, rf_probs)
-lr_fpr, lr_tpr, _ = roc_curve(y_test, lr_probs)
-# 计算 ROC 曲线下面积（AUC）
-rf_auc = roc_auc_score(y_test, rf_probs)
-lr_auc = roc_auc_score(y_test, lr_probs)
-# # 训练 XGBoost 分类器
-# xgb_model = XGBClassifier(enable_categorical=True)
-# xgb_model.fit(X_train_xgboost, y_train)
+# Main execution function
+def main():
+    """Main workflow for data processing, model training, evaluation and visualization"""
+    # 1. Load configuration and data
+    config = ModelConfig()
+    train_data, test_data, val_data, full_data, drop_data = load_data(config.DATA_PATHS)
 
-# 训练 KNN 分类器
-knn_model = KNeighborsClassifier()
-knn_model.fit(X_train, y_train)
-# 训练 SVM 分类器
-svm_model = SVC(probability=True)
-svm_model.fit(X_train, y_train)
-# 获取各个模型在测试集上的预测概率
-# xgb_probs = xgb_model.predict_proba(X_test_xgboost)[:, 1]
-knn_probs = knn_model.predict_proba(X_test)[:, 1]
-svm_probs = svm_model.predict_proba(X_test)[:, 1]
-# 计算 ROC 曲线的各项指标
-# xgb_fpr, xgb_tpr, _ = roc_curve(y_test, xgb_probs)
-knn_fpr, knn_tpr, _ = roc_curve(y_test, knn_probs)
-svm_fpr, svm_tpr, _ = roc_curve(y_test, svm_probs)
-# 计算 ROC 曲线下面积（AUC）
-# xgb_auc = roc_auc_score(y_test, xgb_probs)
-knn_auc = roc_auc_score(y_test, knn_probs)
-svm_auc = roc_auc_score(y_test, svm_probs)
-# # 训练 LightGBM 分类器
-# lgbm_model = LGBMClassifier()
-# lgbm_model.fit(X_train, y_train)
-# 训练 AdaBoost 分类器
-adaboost_model = AdaBoostClassifier()
-adaboost_model.fit(X_train, y_train)
-# 获取各个模型在测试集上的预测概率
-# lgbm_probs = lgbm_model.predict_proba(X_test)[:, 1]
-adaboost_probs = adaboost_model.predict_proba(X_test)[:, 1]
-# 计算 ROC 曲线的各项指标
-# lgbm_fpr, lgbm_tpr, _ = roc_curve(y_test, lgbm_probs)
-adaboost_fpr, adaboost_tpr, _ = roc_curve(y_test, adaboost_probs)
-# 计算 ROC 曲线下面积（AUC）
-# lgbm_auc = roc_auc_score(y_test, lgbm_probs)
-adaboost_auc = roc_auc_score(y_test, adaboost_probs)
-# 训练随机森林分类器
-rf_model.fit(X_train, y_train)
-# 训练逻辑回归模型
-lr_model.fit(X_train, y_train)
+    # 2. Prepare features and labels
+    X_train, y_train, y_train_noisy, X_test, y_test, y_test_noisy, X_val, y_val, y_val_noisy = prepare_features_labels(
+        train_data, test_data, val_data, config.NOISE_LEVELS
+    )
 
-# 获取训练集上的预测概率
-rf_train_probs = rf_model.predict_proba(X_train)[:, 1]
-lr_train_probs = lr_model.predict_proba(X_train)[:, 1]
-# xgb_train_probs = xgb_model.predict_proba(X_train_xgboost)[:,1]
-# 计算训练集上的 ROC 曲线的各项指标
-rf_train_fpr, rf_train_tpr, _ = roc_curve(y_train, rf_train_probs)
-lr_train_fpr, lr_train_tpr, _ = roc_curve(y_train, lr_train_probs)
-# xgb_train_fpr, xgb_train_tpr, _ = roc_curve(y_train,xgb_train_probs)
-# 计算训练集上的 ROC 曲线下面积（AUC）
-rf_train_auc = roc_auc_score(y_train, rf_train_probs)
-lr_train_auc = roc_auc_score(y_train, lr_train_probs)
-# xgb_train_auc = roc_auc_score(y_train,xgb_train_probs)
-# 对于其他模型，按照类似的步骤进行操作
-# 训练 KNN 分类器
-knn_model.fit(X_train, y_train)
-# 训练 SVM 分类器
-svm_model.fit(X_train, y_train)
-# 训练 AdaBoost 分类器
-adaboost_model.fit(X_train, y_train)
+    # 3. Train CatBoost model
+    print("Training CatBoost model...")
+    catboost_model = train_catboost(
+        X_train, y_train, X_test, y_test,
+        config.CAT_FEATURES, config.CATBOOST_PARAMS
+    )
 
-# 获取各个模型在训练集上的预测概率
-knn_train_probs = knn_model.predict_proba(X_train)[:, 1]
-svm_train_probs = svm_model.predict_proba(X_train)[:, 1]
-adaboost_train_probs = adaboost_model.predict_proba(X_train)[:, 1]
+    # 4. Make predictions with CatBoost
+    cb_train_preds = catboost_model.predict(X_train)
+    cb_test_preds = catboost_model.predict(X_test)
+    cb_val_preds = catboost_model.predict(X_val)
 
-# 计算训练集上的 ROC 曲线的各项指标
-knn_train_fpr, knn_train_tpr, _ = roc_curve(y_train, knn_train_probs)
-svm_train_fpr, svm_train_tpr, _ = roc_curve(y_train, svm_train_probs)
-adaboost_train_fpr, adaboost_train_tpr, _ = roc_curve(y_train, adaboost_train_probs)
+    cb_train_probs = catboost_model.predict_proba(X_train)[:, 1]
+    cb_test_probs = catboost_model.predict_proba(X_test)[:, 1]
+    cb_val_probs = catboost_model.predict_proba(X_val)[:, 1]
 
-# 计算训练集上的 ROC 曲线下面积（AUC）
-knn_train_auc = roc_auc_score(y_train, knn_train_probs)
-svm_train_auc = roc_auc_score(y_train, svm_train_probs)
-adaboost_train_auc = roc_auc_score(y_train, adaboost_train_probs)
-# 画出 ROC 曲线
-# 画出训练集的 ROC 曲线
-plt.figure(figsize=(8, 6))
-plt.plot(train_fpr, train_tpr, label=f'CatBoost AUC = {train_auc:.3f}')
-plt.plot(rf_train_fpr, rf_train_tpr, label=f'Random Forest AUC = {rf_train_auc:.3f}')
-plt.plot(lr_train_fpr, lr_train_tpr, label=f'Logistic Regression AUC = {lr_train_auc:.3f}')
-# plt.plot(xgb_train_fpr, xgb_train_tpr, label=f'XGBoost AUC = {xgb_train_auc:.3f}')
-plt.plot(knn_train_fpr, knn_train_tpr, label=f'KNN AUC = {knn_train_auc:.3f}')
-plt.plot(svm_train_fpr, svm_train_tpr, label=f'SVM AUC = {svm_train_auc:.3f}')
-# plt.plot(lgbm_train_fpr, lgbm_train_tpr, label=f'LightGBM AUC = {lgbm_train_auc:.3f}')
-plt.plot(adaboost_train_fpr, adaboost_train_tpr, label=f'AdaBoost AUC = {adaboost_train_auc:.3f}')
-plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-plt.xlabel('False Positive Rate',fontdict={'size': 20})
-plt.ylabel('True Positive Rate',fontdict={'size': 20})
-plt.title('Train ROC Curve Comparison',fontdict={'size': 25})
-plt.legend()
-plt.show()
+    # 5. Calculate classification metrics for CatBoost
+    train_metrics = calculate_classification_metrics(y_train_noisy, cb_train_preds)
+    test_metrics = calculate_classification_metrics(y_test_noisy, cb_test_preds)
+    val_metrics = calculate_classification_metrics(y_val_noisy, cb_val_preds)
 
-plt.figure(figsize=(8, 6))
-plt.plot(test_fpr, test_tpr, label=f'CatBoost AUC = {test_auc:.3f}')
-plt.plot(rf_fpr, rf_tpr, label=f'Random Forest AUC = {rf_auc:.3f}')
-plt.plot(lr_fpr, lr_tpr, label=f'Logistic Regression AUC = {lr_auc:.3f}')
-# plt.plot(xgb_fpr, xgb_tpr, label=f'XGBoost AUC = {xgb_auc:.2f}')
-plt.plot(knn_fpr, knn_tpr, label=f'KNN AUC = {knn_auc:.3f}')
-plt.plot(svm_fpr, svm_tpr, label=f'SVM AUC = {svm_auc:.3f}')
-# plt.plot(lgbm_fpr, lgbm_tpr, label=f'LightGBM AUC = {lgbm_auc:.2f}')
-plt.plot(adaboost_fpr, adaboost_tpr, label=f'AdaBoost AUC = {adaboost_auc:.3f}')
-plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-plt.xlabel('False Positive Rate',fontdict={'size': 20})
-plt.ylabel('True Positive Rate',fontdict={'size': 20})
-plt.title('Internal Validation ROC Curve Comparison',fontdict={'size': 25})
-plt.legend()
-plt.show()
+    # 6. Print metrics summary
+    individual_metrics, mean_std_metrics = compute_metrics_summary(train_metrics, test_metrics, val_metrics)
+    print("\nIndividual Dataset Metrics:")
+    print(individual_metrics)
+    print("\nOverall Metrics (Mean ± Std):")
+    print(mean_std_metrics)
+
+    # 7. Calculate ROC-AUC for CatBoost (train/test/validation)
+    cb_roc_train = calculate_roc_auc(y_train_noisy, cb_train_probs)
+    cb_roc_test = calculate_roc_auc(y_test, cb_test_probs)
+    cb_roc_val = calculate_roc_auc(y_val, cb_val_probs)
+
+    # Plot CatBoost ROC curve (all datasets)
+    roc_data_cb = {
+        'Train': cb_roc_train,
+        'Internal Validation': cb_roc_test,
+        'External Validation': cb_roc_val
+    }
+    plot_roc_curve(
+        roc_data_cb,
+        'ROC Curve (CatBoost)',
+        config.PLOT_FIGSIZE,
+        config.PLOT_LABEL_FONTSIZE,
+        config.PLOT_TITLE_FONTSIZE
+    )
+
+    # 8. Plot CatBoost learning curve and feature importance
+    train_pool = Pool(X_train, y_train, cat_features=config.CAT_FEATURES)
+    plot_catboost_learning_curve(
+        catboost_model,
+        config.PLOT_FIGSIZE,
+        config.PLOT_LABEL_FONTSIZE,
+        config.PLOT_TITLE_FONTSIZE
+    )
+    plot_top_features(catboost_model, train_pool, config.TOP_FEATURES)
+
+    # 9. Train baseline models
+    print("\nTraining baseline models...")
+    baseline_models = train_baseline_models(X_train, y_train)
+
+    # 10. Calculate ROC-AUC for baseline models (train and test)
+    # Train set ROC data
+    roc_data_train = {'CatBoost': cb_roc_train}
+    # Test set ROC data
+    roc_data_test = {'CatBoost': cb_roc_test}
+
+    for name, model in baseline_models.items():
+        # Train set predictions
+        train_probs = model.predict_proba(X_train)[:, 1]
+        fpr_train, tpr_train, auc_train = calculate_roc_auc(y_train, train_probs)
+        roc_data_train[name] = (fpr_train, tpr_train, auc_train)
+
+        # Test set predictions
+        test_probs = model.predict_proba(X_test)[:, 1]
+        fpr_test, tpr_test, auc_test = calculate_roc_auc(y_test, test_probs)
+        roc_data_test[name] = (fpr_test, tpr_test, auc_test)
+
+    # Plot baseline models ROC curves
+    plot_roc_curve(
+        roc_data_train,
+        'Train ROC Curve Comparison',
+        config.PLOT_FIGSIZE,
+        config.PLOT_LABEL_FONTSIZE,
+        config.PLOT_TITLE_FONTSIZE
+    )
+
+    plot_roc_curve(
+        roc_data_test,
+        'Internal Validation ROC Curve Comparison',
+        config.PLOT_FIGSIZE,
+        config.PLOT_LABEL_FONTSIZE,
+        config.PLOT_TITLE_FONTSIZE
+    )
+
+if __name__ == '__main__':
+    main()
