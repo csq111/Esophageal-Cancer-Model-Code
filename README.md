@@ -13,3 +13,4 @@ Our retrospective study was approved by the ethics committee (2022KY206). After 
 | test survival.py       | Cox proportional hazards model training + feature selection + survival analysis (consistency index / survival curve) |
 | Active Learning.py     | Based on the active learning strategy of BALD, iteratively select high-value samples to expand the training set |
 | DCA and calibration.py | Decision curve analysis (DCA) + model calibration curve, to evaluate the clinical net benefit of the model  |
+|
