@@ -32,7 +32,7 @@ Our retrospective study was approved by the ethics committee **(2022KY206)**. Af
 - `PFS_m` (Progression-Free Time, Months)
 **2. Core Step**
    Step1: Run Activate Learning.py. For activately selecting the data with high heterogeneity.
-   Step2: Run Ensemble Sampling.py.
+   Step2: Run final Catboost model.py to build and evaluate the model
   
   
 ## Notes
