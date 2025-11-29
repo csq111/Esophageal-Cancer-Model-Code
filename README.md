@@ -34,4 +34,4 @@ The path of the data file is given as a local path example in the code. When usi
 - Optimize the active learning strategy by integrating uncertainty quantification with clinical prior knowledge. 
 
 ## Contact Information
-If you have any questions, please contact 223050027@link.cuhk.edu.cn.
+If you have any questions, please contact **shiqingleicmu@gmail.com** and 223050027@link.cuhk.edu.cn.
