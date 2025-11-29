@@ -4,6 +4,12 @@ This code repository focuses on the development and evaluation of prognostic pre
 ## Environment
 **Python 3.7+** and **R 4.3.3**
 ## Data
+The dataset used in the code consists of clinical characteristics and prognosis data of patients with esophageal cancer, and mainly includes the following types: 
+- Baseline characteristics (such as age, tumor location, TNM stage, etc.)
+- Treatment-related characteristics (such as radiotherapy dose, treatment plan, etc.)
+- Prognostic indicators (**OS: overall survival**; **PFS: progression-free survival**; **LRFS: no local recurrence survival**; **LC: local control**, etc.) 
+
+The path of the data file is given as a local path example in the code. When using it in practice, it should be replaced with your own dataset path, and ensure that the data format is consistent with the processing logic in the code (CSV format, including feature columns and prognosis label columns).
 Our retrospective study was approved by the ethics committee **(2022KY206)**. After data inclusion and exclusion screening, image reconstruction and segmentation, as well as feature value extraction, data preprocessing was carried out. Finally, **490** cases of data were retained, and **99** of them were used as internal validation data. Subsequently, an active learning strategy was applied to select **370** samples with high heterogeneity from the remaining 391 cases of data, completing the selection of the training set.
 ## Code Structure
 | Name               | Function                                                                 |
@@ -15,13 +21,20 @@ Our retrospective study was approved by the ethics committee **(2022KY206)**. Af
 | DCA and calibration.py | Decision curve analysis (DCA) + model calibration curve, to evaluate the clinical net benefit of the model  |
 | forest plot.R | Draw forest plots and other charts based on the existing data |
 | km curve.R | Draw the km curve based on the Python running result |
-## Data Description 
-The dataset used in the code consists of clinical characteristics and prognosis data of patients with esophageal cancer, and mainly includes the following types: 
-- Baseline characteristics (such as age, tumor location, TNM stage, etc.)
-- Treatment-related characteristics (such as radiotherapy dose, treatment plan, etc.)
-- Prognostic indicators (OS: overall survival; PFS: progression-free survival; LRFS: no local recurrence survival; LC: local control, etc.) 
-
-The path of the data file is given as a local path example in the code. When using it in practice, it should be replaced with your own dataset path, and ensure that the data format is consistent with the processing logic in the code (CSV format, including feature columns and prognosis label columns).
+## Guide
+**1. Data Preparation**
+   The `sample_data` folder in the project root directory already contains simulated clinical data for esophageal cancer (de-identified data to protect privacy). File structure:
+   **Key Fields**:
+- `Age` (Age)
+- `Location` (Tumor Location)
+- `TNM` (Staging)
+- `PFS` (Progression-Free Survival)
+- `PFS_m` (Progression-Free Time, Months)
+**2. Core Step**
+   Step1: Run Activate Learning.py. For activately selecting the data with high heterogeneity.
+   Step2: Run Ensemble Sampling.py.
+  
+  
 ## Notes
 1. Data path: The local absolute path is used in the code. During actual deployment, it is necessary to modify it to a relative path or dynamic path according to the location of the data set.
 2. Feature processing: The features corresponding to different prognostic indicators (OS/PFS/LRFS/LC) may vary. The feature selection logic needs to be adjusted according to the specific task.
